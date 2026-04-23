@@ -171,20 +171,21 @@ class USBPasswordBruteForcer:
                     
         return False
     
-    def brute_force_attack(self, charset, min_length, max_length, start_char=None, start_num=None):
+    def brute_force_attack(self, charset, min_length, max_length, start_char=None, start_num=None, process_id=None):
         """Perform a brute force attack with character set and length range"""
-        print(f"Starting brute force attack with charset: {charset}")
-        print(f"Testing passwords from length {min_length} to {max_length}")
+        prefix = f"[Process {process_id}] " if process_id is not None else ""
+        print(f"{prefix}Starting brute force attack with charset: {charset}")
+        print(f"{prefix}Testing passwords from length {min_length} to {max_length}")
         
         # If starting character and number are specified, adjust the charset and start point
         if start_char and start_num:
-            print(f"Starting from character '{start_char}' with offset {start_num}")
+            print(f"{prefix}Starting from character '{start_char}' with offset {start_num}")
             
         for length in range(min_length, max_length + 1):
             if self.stop_flag is not None and self.stop_flag.value:
                 break
                 
-            print(f"Testing passwords of length {length}...")
+            print(f"{prefix}Testing passwords of length {length}...")
             
             # Generate all possible combinations for this length
             combinations = itertools.product(charset, repeat=length)
@@ -205,14 +206,15 @@ class USBPasswordBruteForcer:
                     
                 password = ''.join(attempt)
                 self.attempts += 1
+                print(f"{prefix}[+] Trying {password}...")
                 
                 if self.test_password(password):
                     self.found_password = password
-                    print(f"Password found: {password}")
+                    print(f"{prefix}Password found: {password}")
                     return True
                     
                 if self.attempts % 1000 == 0:
-                    print(f"Tested {self.attempts} passwords...")
+                    print(f"{prefix}Tested {self.attempts} passwords...")
                     
         return False
     
@@ -246,7 +248,7 @@ class USBPasswordBruteForcer:
             adjusted_num = None
             
         # Run the brute force attack
-        success = local_forcer.brute_force_attack(charset, min_length, max_length, adjusted_char, adjusted_num)
+        success = local_forcer.brute_force_attack(charset, min_length, max_length, adjusted_char, adjusted_num, process_id)
         
         # If password was found, put it in the result queue
         if success:
