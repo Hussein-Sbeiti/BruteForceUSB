@@ -365,7 +365,7 @@ class USBPasswordBruteForcer:
         return None
 
     def build_worker_command(self, process_id, charset, min_length, max_length,
-                             start_index, end_index, comm_dir, attempts_file):
+                             start_index, end_index, comm_dir, attempts_file, done_file):
         """Build the CLI command to launch a worker in a new terminal."""
         script_path = os.path.abspath(__file__)
         args = [
@@ -381,13 +381,14 @@ class USBPasswordBruteForcer:
             "--end-index", str(end_index),
             "--comm-dir", comm_dir,
             "--attempts-file", attempts_file,
+            "--done-file", done_file,
         ]
         if self.wordlist_path:
             args.extend(["--wordlist-path", self.wordlist_path])
         return " ".join(shlex.quote(arg) for arg in args)
 
     def run_worker(self, process_id, charset, min_length, max_length,
-                   start_index, end_index, comm_dir, attempts_file):
+                   start_index, end_index, comm_dir, attempts_file, done_file):
         """Run a worker from the CLI worker entrypoint."""
         self.stop_file = os.path.join(comm_dir, "stop")
         self.attempts_file = attempts_file
@@ -413,6 +414,12 @@ class USBPasswordBruteForcer:
                     stop_file.write("stop")
             except Exception:
                 pass
+
+        try:
+            with open(done_file, "w", encoding="utf-8") as f:
+                f.write("done")
+        except Exception:
+            pass
 
         return success
 
@@ -442,6 +449,7 @@ class USBPasswordBruteForcer:
         workers = []
         attempts_files = []
 
+        done_files = []
         for i in range(processes):
             start_index = start_offset + i * chunk_size
             end_index = min(start_index + chunk_size, total)
@@ -449,8 +457,9 @@ class USBPasswordBruteForcer:
                 continue
 
             attempts_file = os.path.join(comm_dir, f"attempts_{i}.txt")
+            done_file = os.path.join(comm_dir, f"done_{i}.txt")
             command = self.build_worker_command(i, charset, min_length, max_length,
-                                               start_index, end_index, comm_dir, attempts_file)
+                                               start_index, end_index, comm_dir, attempts_file, done_file)
             terminal_process = self.open_cmd(i, command=command, hold=False)
             if not terminal_process:
                 print(f"Failed to open terminal for process {i}. Falling back.")
@@ -459,11 +468,12 @@ class USBPasswordBruteForcer:
 
             workers.append(terminal_process)
             attempts_files.append(attempts_file)
+            done_files.append(done_file)
 
         result_path = os.path.join(comm_dir, "result.txt")
         found = False
 
-        while not found and any(p.poll() is None for p in workers):
+        while not found and not all(os.path.exists(done_file) for done_file in done_files):
             if os.path.exists(result_path):
                 try:
                     with open(result_path, "r", encoding="utf-8") as f:
@@ -540,17 +550,19 @@ USB Password Brute Forcer
     parser.add_argument("--end-index", type=int)
     parser.add_argument("--comm-dir", type=str)
     parser.add_argument("--attempts-file", type=str)
+    parser.add_argument("--done-file", type=str)
     args, _ = parser.parse_known_args()
 
     if args.worker:
         if not args.drive_path or args.charset is None or args.min_length is None or args.max_length is None \
-                or args.start_index is None or args.end_index is None or args.comm_dir is None or args.attempts_file is None:
+                or args.start_index is None or args.end_index is None or args.comm_dir is None \
+                or args.attempts_file is None or args.done_file is None:
             print("Worker mode requires all --worker arguments.")
             sys.exit(1)
 
         forcer = USBPasswordBruteForcer(args.drive_path, args.wordlist_path)
         forcer.run_worker(args.process_id, args.charset, args.min_length, args.max_length,
-                          args.start_index, args.end_index, args.comm_dir, args.attempts_file)
+                          args.start_index, args.end_index, args.comm_dir, args.attempts_file, args.done_file)
         sys.exit(0)
     # Interactive Input
     drive_path = input("Enter the drive path (e.g., /dev/sdb1 or D:\\\\): ").strip()
