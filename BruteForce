@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import sys
 import subprocess
@@ -8,6 +9,10 @@ import platform
 import threading
 import string
 import signal
+import tempfile
+import math
+import shlex
+import shutil
 from multiprocessing import Pool, cpu_count, Process, Queue, Value, Array
 from queue import Empty
 
@@ -36,40 +41,58 @@ class USBPasswordBruteForcer:
         if self.stop_flag is not None:
             self.stop_flag.value = True
     
-    def open_cmd(self, process_id=0):
-        """Open a command prompt window based on the OS"""
+    def open_cmd(self, process_id=0, command=None, hold=False):
+        """Open a command prompt window based on the OS, optionally running a command."""
+        title = f"BruteForce Process {process_id}"
         if self.os_type == "windows":
-            # For Windows, open a new CMD window with a title
-            cmd = f'start "BruteForce Process {process_id}" cmd /k'
-            subprocess.Popen(cmd, shell=True)
+            if command:
+                cmd = f'start "{title}" cmd /k "{command} & pause"'
+            else:
+                cmd = f'start "{title}" cmd /k'
+            return subprocess.Popen(cmd, shell=True)
+
         elif self.os_type == "linux":
-            # For Linux, open a new terminal window
-            terminal_emulators = ["gnome-terminal", "konsole", "xterm", "xfce4-terminal"]
+            terminal_emulators = ["gnome-terminal", "konsole", "xfce4-terminal", "xterm"]
             for term in terminal_emulators:
                 try:
-                    if term == "gnome-terminal":
-                        cmd = [term, "--title", f"BruteForce Process {process_id}", "--"]
-                    elif term == "konsole":
-                        cmd = [term, "--title", f"BruteForce Process {process_id}", "-e"]
+                    if command:
+                        wrapped_cmd = command + ('; exec bash' if hold else '')
                     else:
-                        cmd = [term, "-title", f"BruteForce Process {process_id}", "-e"]
-                    subprocess.Popen(cmd + ["bash"])
-                    break
+                        wrapped_cmd = "bash"
+
+                    if term == "gnome-terminal":
+                        args = [term, "--title", title, "--", "bash", "-lc", wrapped_cmd]
+                    elif term == "konsole":
+                        args = [term, "--title", title, "-e", "bash", "-lc", wrapped_cmd]
+                    elif term == "xfce4-terminal":
+                        args = [term, "--title", title, "--command", f"bash -lc {shlex.quote(wrapped_cmd)}"]
+                    else:
+                        args = [term, "-T", title, "-e", "bash", "-lc", wrapped_cmd]
+
+                    return subprocess.Popen(args)
                 except (FileNotFoundError, subprocess.SubprocessError):
                     continue
+            return False
+
         elif self.os_type == "darwin":  # macOS
-            # For macOS, open a new Terminal window
-            applescript = f'''
-            tell application "Terminal"
-                do script "echo 'BruteForce Process {process_id}'"
-                activate
-            end tell
-            '''
-            subprocess.Popen(["osascript", "-e", applescript])
+            if command:
+                applescript = f'''
+                tell application "Terminal"
+                    do script {shlex.quote(command)}
+                    activate
+                end tell
+                '''
+            else:
+                applescript = f'''
+                tell application "Terminal"
+                    activate
+                end tell
+                '''
+            return subprocess.Popen(["osascript", "-e", applescript])
+
         else:
             print(f"Unsupported OS: {self.os_type}")
             return False
-        return True
     
     def test_password(self, password):
         """Test if a password unlocks the USB drive"""
@@ -171,160 +194,320 @@ class USBPasswordBruteForcer:
                     
         return False
     
-    def brute_force_attack(self, charset, min_length, max_length, start_char=None, start_num=None, process_id=None):
-        """Perform a brute force attack with character set and length range"""
+    def total_combinations(self, charset, min_length, max_length):
+        """Return the total number of combinations in the given length range."""
+        return sum(len(charset) ** length for length in range(min_length, max_length + 1))
+
+    def index_to_password(self, index, charset, min_length, max_length):
+        """Convert a linear index into its corresponding password."""
+        charset_size = len(charset)
+        length = min_length
+        remaining = index
+
+        while length <= max_length:
+            block_count = charset_size ** length
+            if remaining < block_count:
+                password = []
+                for pos in range(length):
+                    divisor = charset_size ** (length - pos - 1)
+                    password.append(charset[(remaining // divisor) % charset_size])
+                    remaining %= divisor
+                return ''.join(password)
+            remaining -= block_count
+            length += 1
+
+        raise IndexError("Index out of range for provided charset and length range")
+
+    def password_to_start_index(self, start_char, start_num, charset, min_length):
+        """Convert a starting character and offset to a global index."""
+        if start_char not in charset:
+            raise ValueError(f"Starting character {start_char!r} is not in the charset")
+        return charset.index(start_char) * (len(charset) ** (min_length - 1)) + start_num
+
+    def should_stop(self):
+        """Check if this process should stop early."""
+        if self.stop_flag is not None and self.stop_flag.value:
+            return True
+        if hasattr(self, 'stop_file') and self.stop_file and os.path.exists(self.stop_file):
+            return True
+        return False
+
+    def brute_force_attack(self, charset, min_length, max_length, start_char=None, start_num=None,
+                           start_index=None, end_index=None, process_id=None):
+        """Perform a brute force attack with character set and length range."""
         prefix = f"[Process {process_id}] " if process_id is not None else ""
         print(f"{prefix}Starting brute force attack with charset: {charset}")
         print(f"{prefix}Testing passwords from length {min_length} to {max_length}")
-        
-        # If starting character and number are specified, adjust the charset and start point
-        if start_char and start_num:
-            print(f"{prefix}Starting from character '{start_char}' with offset {start_num}")
-            
-        for length in range(min_length, max_length + 1):
-            if self.stop_flag is not None and self.stop_flag.value:
+
+        if start_index is None:
+            if start_char is not None and start_num is not None:
+                start_index = self.password_to_start_index(start_char, start_num, charset, min_length)
+                print(f"{prefix}Starting from character '{start_char}' with offset {start_num}")
+            else:
+                start_index = 0
+
+        total = self.total_combinations(charset, min_length, max_length)
+        if end_index is None or end_index > total:
+            end_index = total
+
+        if start_index >= end_index:
+            print(f"{prefix}No passwords to test for this range (start_index {start_index} >= end_index {end_index})")
+            return False
+
+        print(f"{prefix}Testing password indices from {start_index} to {end_index}")
+
+        for index in range(start_index, end_index):
+            if self.should_stop():
                 break
-                
-            print(f"{prefix}Testing passwords of length {length}...")
-            
-            # Generate all possible combinations for this length
-            combinations = itertools.product(charset, repeat=length)
-            
-            # If we have a starting point, skip to it
-            if start_char and start_num and length == min_length:
-                # Calculate the starting index based on the character and number
-                start_index = charset.index(start_char) * (len(charset) ** (length-1)) + start_num
-                for _ in range(start_index):
-                    try:
-                        next(combinations)
-                    except StopIteration:
-                        break
-            
-            for attempt in combinations:
-                if self.stop_flag is not None and self.stop_flag.value:
-                    break
-                    
-                password = ''.join(attempt)
-                self.attempts += 1
-                print(f"{prefix}[+] Trying {password}...")
-                
-                if self.test_password(password):
-                    self.found_password = password
-                    print(f"{prefix}Password found: {password}")
-                    return True
-                    
-                if self.attempts % 1000 == 0:
-                    print(f"{prefix}Tested {self.attempts} passwords...")
-                    
+
+            password = self.index_to_password(index, charset, min_length, max_length)
+            self.attempts += 1
+            print(f"{prefix}[+] Trying {password}...")
+
+            if self.test_password(password):
+                self.found_password = password
+                print(f"{prefix}Password found: {password}")
+                return True
+
+            if self.attempts % 1000 == 0:
+                print(f"{prefix}Tested {self.attempts} passwords...")
+
         return False
     
-    def worker_process(self, charset, min_length, max_length, start_char, start_num, 
+    def worker_process(self, charset, min_length, max_length, start_index, end_index,
                       process_id, result_queue, stop_flag, attempts_counter):
-        """Worker process for parallel brute force attack"""
-        # Open a new CMD window for this process
+        """Worker process for parallel brute force attack."""
         self.open_cmd(process_id)
-        
-        # Create a new instance for this process
+
         local_forcer = USBPasswordBruteForcer(self.drive_path, self.wordlist_path)
         local_forcer.stop_flag = stop_flag
-        
-        # Calculate the starting point for this process
-        if start_char and start_num:
-            # Calculate the offset based on process_id to distribute the workload
-            charset_size = len(charset)
-            total_combinations = charset_size ** min_length
-            processes = cpu_count()
-            chunk_size = total_combinations // processes
-            
-            # Calculate the starting index for this process
-            start_index = process_id * chunk_size
-            
-            # Convert the index back to a starting character and number
-            adjusted_char_index = start_index // (charset_size ** (min_length-1)) % charset_size
-            adjusted_char = charset[adjusted_char_index]
-            adjusted_num = start_index % (charset_size ** (min_length-1))
-        else:
-            adjusted_char = None
-            adjusted_num = None
-            
-        # Run the brute force attack
-        success = local_forcer.brute_force_attack(charset, min_length, max_length, adjusted_char, adjusted_num, process_id)
-        
-        # If password was found, put it in the result queue
+
+        success = local_forcer.brute_force_attack(
+            charset, min_length, max_length,
+            start_index=start_index, end_index=end_index, process_id=process_id
+        )
+
         if success:
             result_queue.put(local_forcer.found_password)
-        
-        # Update the attempts counter
+
         attempts_counter.value += local_forcer.attempts
-        
         return success
     
     def parallel_brute_force(self, charset, min_length, max_length, processes=None, start_char=None, start_num=None):
-        """Perform a parallel brute force attack using multiple processes"""
+        """Perform a parallel brute force attack using multiple processes."""
         if not processes:
             processes = cpu_count()
-            
+
         print(f"Starting parallel brute force with {processes} processes")
-        
-        # Create shared variables for inter-process communication
+
+        if self.os_type == "linux":
+            terminal = self.find_terminal_emulator()
+            if terminal:
+                return self.parallel_brute_force_with_terminals(charset, min_length, max_length,
+                                                                processes, start_char, start_num)
+            print("No supported terminal emulator found; using shared-interface parallel mode.")
+
+        return self._parallel_brute_force_shared(charset, min_length, max_length,
+                                                 processes, start_char, start_num)
+
+    def _parallel_brute_force_shared(self, charset, min_length, max_length, processes=None,
+                                     start_char=None, start_num=None):
+        """Perform a shared-interface parallel brute force attack."""
         self.stop_flag = Value('b', False)
         result_queue = Queue()
         attempts_counter = Value('i', 0)
-        
-        # Create and start worker processes
+
+        total = self.total_combinations(charset, min_length, max_length)
+        if start_char is not None and start_num is not None:
+            start_offset = self.password_to_start_index(start_char, start_num, charset, min_length)
+        else:
+            start_offset = 0
+
+        chunk_size = math.ceil((total - start_offset) / processes)
         workers = []
-        
+
         for i in range(processes):
+            start_index = start_offset + i * chunk_size
+            end_index = min(start_index + chunk_size, total)
+            if start_index >= end_index:
+                continue
+
             p = Process(
                 target=self.worker_process,
-                args=(charset, min_length, max_length, start_char, start_num, i, result_queue, self.stop_flag, attempts_counter)
+                args=(charset, min_length, max_length, start_index, end_index,
+                      i, result_queue, self.stop_flag, attempts_counter)
             )
             p.start()
             workers.append(p)
-        
-        # Monitor the result queue for a found password
+
         found = False
         while any(p.is_alive() for p in workers) and not found:
             try:
-                # Check for a found password
                 found_password = result_queue.get(timeout=1)
                 self.found_password = found_password
                 print(f"Password found: {found_password}")
                 found = True
-                
-                # Signal all workers to stop
                 self.stop_flag.value = True
-                
             except Empty:
-                # No result yet, continue checking
                 pass
-        
-        # Wait for all processes to finish
+
         for p in workers:
             p.join()
-        
-        # Update the total attempts
+
         self.attempts = attempts_counter.value
-        
         return found
-    
-    def run(self, attack_type="dictionary", charset="abcdefghijklmnopqrstuvwxyz0123456789", 
+
+    def find_terminal_emulator(self):
+        """Return the first available terminal emulator on this machine."""
+        for term in ["gnome-terminal", "konsole", "xfce4-terminal", "xterm"]:
+            if shutil.which(term):
+                return term
+        return None
+
+    def build_worker_command(self, process_id, charset, min_length, max_length,
+                             start_index, end_index, comm_dir, attempts_file):
+        """Build the CLI command to launch a worker in a new terminal."""
+        script_path = os.path.abspath(__file__)
+        args = [
+            sys.executable,
+            script_path,
+            "--worker",
+            "--process-id", str(process_id),
+            "--drive-path", self.drive_path,
+            "--charset", charset,
+            "--min-length", str(min_length),
+            "--max-length", str(max_length),
+            "--start-index", str(start_index),
+            "--end-index", str(end_index),
+            "--comm-dir", comm_dir,
+            "--attempts-file", attempts_file,
+        ]
+        if self.wordlist_path:
+            args.extend(["--wordlist-path", self.wordlist_path])
+        return " ".join(shlex.quote(arg) for arg in args)
+
+    def run_worker(self, process_id, charset, min_length, max_length,
+                   start_index, end_index, comm_dir, attempts_file):
+        """Run a worker from the CLI worker entrypoint."""
+        self.stop_file = os.path.join(comm_dir, "stop")
+        self.attempts_file = attempts_file
+        self.found_password = None
+        self.attempts = 0
+
+        success = self.brute_force_attack(
+            charset, min_length, max_length,
+            start_index=start_index, end_index=end_index, process_id=process_id
+        )
+
+        try:
+            with open(attempts_file, "w", encoding="utf-8") as f:
+                f.write(str(self.attempts))
+        except Exception:
+            pass
+
+        if success and self.found_password:
+            try:
+                with open(os.path.join(comm_dir, "result.txt"), "w", encoding="utf-8") as result_file:
+                    result_file.write(self.found_password)
+                with open(self.stop_file, "w", encoding="utf-8") as stop_file:
+                    stop_file.write("stop")
+            except Exception:
+                pass
+
+        return success
+
+    def parallel_brute_force_with_terminals(self, charset, min_length, max_length,
+                                            processes, start_char=None, start_num=None):
+        """Launch parallel workers in separate Linux terminal windows."""
+        terminal = self.find_terminal_emulator()
+        if terminal is None:
+            print("No supported terminal emulator found; falling back to shared-interface parallel mode.")
+            return self.parallel_brute_force(charset, min_length, max_length, processes, start_char, start_num)
+
+        total = self.total_combinations(charset, min_length, max_length)
+        if start_char is not None and start_num is not None:
+            start_offset = self.password_to_start_index(start_char, start_num, charset, min_length)
+        else:
+            start_offset = 0
+
+        if start_offset >= total:
+            print("Starting offset is beyond the password space.")
+            return False
+
+        chunk_size = math.ceil((total - start_offset) / processes)
+        comm_dir = tempfile.mkdtemp(prefix="usb_bruteforce_")
+        self.attempts = 0
+        self.found_password = None
+
+        workers = []
+        attempts_files = []
+
+        for i in range(processes):
+            start_index = start_offset + i * chunk_size
+            end_index = min(start_index + chunk_size, total)
+            if start_index >= end_index:
+                continue
+
+            attempts_file = os.path.join(comm_dir, f"attempts_{i}.txt")
+            command = self.build_worker_command(i, charset, min_length, max_length,
+                                               start_index, end_index, comm_dir, attempts_file)
+            terminal_process = self.open_cmd(i, command=command, hold=False)
+            if not terminal_process:
+                print(f"Failed to open terminal for process {i}. Falling back.")
+                return self._parallel_brute_force_shared(charset, min_length, max_length,
+                                                        processes, start_char, start_num)
+
+            workers.append(terminal_process)
+            attempts_files.append(attempts_file)
+
+        result_path = os.path.join(comm_dir, "result.txt")
+        found = False
+
+        while not found and any(p.poll() is None for p in workers):
+            if os.path.exists(result_path):
+                try:
+                    with open(result_path, "r", encoding="utf-8") as f:
+                        self.found_password = f.read().strip()
+                        found = bool(self.found_password)
+                except Exception:
+                    pass
+
+                if found:
+                    open(os.path.join(comm_dir, "stop"), "w", encoding="utf-8").write("stop")
+                    break
+
+            time.sleep(1)
+
+        total_attempts = 0
+        for attempts_file in attempts_files:
+            try:
+                with open(attempts_file, "r", encoding="utf-8") as f:
+                    total_attempts += int(f.read().strip())
+            except Exception:
+                pass
+
+        self.attempts = total_attempts
+        return found
+
+    def run(self, attack_type="dictionary", charset="abcdefghijklmnopqrstuvwxyz0123456789",
             min_length=1, max_length=8, processes=None, start_char=None, start_num=None):
         """Run the brute force attack"""
         start_time = time.time()
-        
+
         if attack_type == "dictionary":
             success = self.dictionary_attack()
         elif attack_type == "bruteforce":
-            success = self.brute_force_attack(charset, min_length, max_length, start_char, start_num)
+            success = self.brute_force_attack(charset, min_length, max_length,
+                                              start_char=start_char, start_num=start_num)
         elif attack_type == "parallel":
-            success = self.parallel_brute_force(charset, min_length, max_length, processes, start_char, start_num)
+            success = self.parallel_brute_force(charset, min_length, max_length,
+                                                processes, start_char, start_num)
         else:
             print(f"Unknown attack type: {attack_type}")
             return False
-            
+
         elapsed_time = time.time() - start_time
-        
+
         if success:
             print(f"Success! Password is: {self.found_password}")
             print(f"Found after {self.attempts} attempts in {elapsed_time:.2f} seconds")
@@ -345,7 +528,30 @@ if __name__ == "__main__":
  |____/|_|   \\__,_|\\__\\___|_|  \\_\\____/|____/|_____/ 
 USB Password Brute Forcer
     """)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--process-id", type=int)
+    parser.add_argument("--drive-path", type=str)
+    parser.add_argument("--wordlist-path", type=str, default=None)
+    parser.add_argument("--charset", type=str)
+    parser.add_argument("--min-length", type=int)
+    parser.add_argument("--max-length", type=int)
+    parser.add_argument("--start-index", type=int)
+    parser.add_argument("--end-index", type=int)
+    parser.add_argument("--comm-dir", type=str)
+    parser.add_argument("--attempts-file", type=str)
+    args, _ = parser.parse_known_args()
 
+    if args.worker:
+        if not args.drive_path or args.charset is None or args.min_length is None or args.max_length is None \
+                or args.start_index is None or args.end_index is None or args.comm_dir is None or args.attempts_file is None:
+            print("Worker mode requires all --worker arguments.")
+            sys.exit(1)
+
+        forcer = USBPasswordBruteForcer(args.drive_path, args.wordlist_path)
+        forcer.run_worker(args.process_id, args.charset, args.min_length, args.max_length,
+                          args.start_index, args.end_index, args.comm_dir, args.attempts_file)
+        sys.exit(0)
     # Interactive Input
     drive_path = input("Enter the drive path (e.g., /dev/sdb1 or D:\\\\): ").strip()
     if not drive_path:
